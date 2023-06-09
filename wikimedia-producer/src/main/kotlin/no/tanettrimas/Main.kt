@@ -4,6 +4,7 @@ import com.launchdarkly.eventsource.EventSource
 import com.launchdarkly.eventsource.MessageEvent
 import com.launchdarkly.eventsource.background.BackgroundEventHandler
 import com.launchdarkly.eventsource.background.BackgroundEventSource
+import com.launchdarkly.eventsource.background.ConnectionErrorHandler
 import kotlinx.coroutines.*
 import org.apache.kafka.clients.CommonClientConfigs
 import org.apache.kafka.clients.producer.KafkaProducer
@@ -13,6 +14,7 @@ import org.apache.kafka.common.serialization.StringSerializer
 import java.net.URI
 import kotlin.time.Duration.Companion.seconds
 
+@OptIn(DelicateCoroutinesApi::class)
 fun main(): Unit = runBlocking {
     val kafkaProperties = mapOf(
         CommonClientConfigs.CLIENT_ID_CONFIG to "wikimedia-v1",
@@ -28,14 +30,29 @@ fun main(): Unit = runBlocking {
         WikistreamProducer(kafkaProducer = producer, topic = topic),
         EventSource.Builder(URI("https://stream.wikimedia.org/v2/stream/recentchange"))
     )
+    val eventSource = builder.build()
 
-    launch {
-        builder.build().use { eventSource ->
-            eventSource.start()
-            delay(10.seconds)
-            this.cancel("Produced for 10 seconds")
+    val job = GlobalScope.launch {
+        eventSource.use { eventSource ->
+            while (isActive) {
+                eventSource.start()
+            }
+            producer.close()
+            println("Producer closed....")
         }
+        println("Finished....")
     }
+    Runtime.getRuntime().addShutdownHook(Thread {
+        runBlocking {
+            job.cancelAndJoin()
+            println("Resources closed....")
+        }
+    })
+    println("Let me delay...")
+    delay(10.seconds)
+    println("Finished delaying")
+    job.cancelAndJoin()
+    println("Finished with work, closing down")
 }
 
 class WikistreamProducer(private val kafkaProducer: KafkaProducer<String, String>, private val topic: String) :
@@ -63,7 +80,7 @@ class WikistreamProducer(private val kafkaProducer: KafkaProducer<String, String
      * @throws Exception throwing an exception here will cause it to be logged and also sent to [.onError]
      */
     override fun onClosed() {
-        println("Shutting down EventSource")
+        kafkaProducer.close()
     }
 
     /**
@@ -73,6 +90,7 @@ class WikistreamProducer(private val kafkaProducer: KafkaProducer<String, String
      * @throws Exception throwing an exception here will cause it to be logged and also sent to [.onError]
      */
     override fun onMessage(event: String, messageEvent: MessageEvent) {
+        println("Received message from eventsource")
         kafkaProducer.send(ProducerRecord(topic, messageEvent.data))
     }
 
